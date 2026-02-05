@@ -372,6 +372,7 @@ def create_trainer(
     warmup_steps: int = 5000,
     total_steps: int = 1000000,
     device: str = "cuda",
+    mae_checkpoint: str = None,
     **kwargs,
 ) -> DriftingTrainer:
     """
@@ -385,6 +386,9 @@ def create_trainer(
         warmup_steps: Warmup steps for scheduler
         total_steps: Total training steps
         device: Device to train on
+        mae_checkpoint: Path to pretrained MAE encoder checkpoint (optional).
+                       If provided, loads pretrained weights into the feature extractor.
+                       This is crucial for achieving SOTA performance per paper Appendix A.3.
         **kwargs: Additional arguments for DriftingTrainer
         
     Returns:
@@ -395,6 +399,17 @@ def create_trainer(
         feature_extractor=feature_extractor,
         in_channels=model.in_chans,
     )
+    
+    # Load pretrained MAE encoder weights if checkpoint is provided
+    # Per paper Appendix A.3: "We found it crucial to use a feature extractor...
+    # raw pixels/latents failed."
+    if mae_checkpoint is not None:
+        print(f"Loading pretrained MAE encoder from: {mae_checkpoint}")
+        if hasattr(loss_fn.feature_extractor, 'load_pretrained'):
+            loss_fn.feature_extractor.load_pretrained(mae_checkpoint, strict=False)
+            print("Successfully loaded pretrained feature extractor weights")
+        else:
+            print("Warning: Feature extractor does not support load_pretrained method")
     
     # Create optimizer with Paper Table 8 settings: no weight decay, standard Adam betas
     optimizer = torch.optim.AdamW(

@@ -8,6 +8,8 @@ The paper states the method fails on ImageNet without a feature encoder.
 The loss is computed on features f(x), not pixels.
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -204,6 +206,11 @@ class LatentFeatureExtractor(nn.Module):
     
     Since the latent space is already a good representation,
     we use a simpler encoder that's faster to compute.
+    
+    This encoder can be pretrained using MAE (Masked Autoencoding) as described
+    in the paper's Appendix A.3:
+    > "We use a ResNet-style network... pre-trained with MAE... on the VAE latent space."
+    > "We found it crucial to use a feature extractor... raw pixels/latents failed."
     """
     
     def __init__(
@@ -214,6 +221,8 @@ class LatentFeatureExtractor(nn.Module):
     ):
         super().__init__()
         
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
         self.num_stages = num_stages
         self.stages = nn.ModuleList()
         
@@ -245,3 +254,58 @@ class LatentFeatureExtractor(nn.Module):
             x = stage(x)
             features.append(x)
         return features
+    
+    def load_pretrained(self, checkpoint_path: str, strict: bool = True) -> None:
+        """
+        Load pretrained weights from MAE encoder checkpoint.
+        
+        This method loads weights from a pretrained MAE encoder, enabling
+        the feature extractor to provide meaningful feature representations
+        for the drifting loss computation.
+        
+        Args:
+            checkpoint_path: Path to the MAE encoder checkpoint (.pt file)
+            strict: Whether to strictly enforce that the keys in state_dict
+                   match the keys returned by this module's state_dict()
+                   
+        Raises:
+            FileNotFoundError: If checkpoint_path does not exist
+            RuntimeError: If checkpoint format is incompatible
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        
+        # Handle different checkpoint formats
+        if isinstance(checkpoint, dict):
+            # Check if it's a full training checkpoint or just state dict
+            if 'encoder_state_dict' in checkpoint:
+                state_dict = checkpoint['encoder_state_dict']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                # Assume the checkpoint is the state dict itself
+                state_dict = checkpoint
+        else:
+            state_dict = checkpoint
+        
+        # Remove 'encoder.' prefix if present (from MAE checkpoint)
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('encoder.'):
+                new_key = key[len('encoder.'):]
+            else:
+                new_key = key
+            new_state_dict[new_key] = value
+        
+        # Load the state dict
+        missing, unexpected = self.load_state_dict(new_state_dict, strict=strict)
+        
+        if missing:
+            print(f"Warning: Missing keys when loading pretrained weights: {missing}")
+        if unexpected:
+            print(f"Warning: Unexpected keys when loading pretrained weights: {unexpected}")

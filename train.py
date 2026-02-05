@@ -231,6 +231,7 @@ def train(
         uncond_prob=args.uncond_prob,
         latent_shape=(args.in_channels, args.latent_size, args.latent_size),
         ema_decay=args.ema_decay,
+        mae_checkpoint=args.mae_checkpoint,
     )
     
     # Resume from checkpoint if specified
@@ -454,6 +455,12 @@ def main():
         type=str,
         default="latent",
         help="Feature extractor type (default: latent)",
+    )
+    parser.add_argument(
+        "--mae_checkpoint",
+        type=str,
+        default=None,
+        help="Path to pretrained MAE encoder checkpoint for feature extractor",
     )
     
     # Queue arguments
