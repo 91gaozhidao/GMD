@@ -85,3 +85,4 @@ logs/
 # Data
 data/
 datasets/
+!drifting/data/
