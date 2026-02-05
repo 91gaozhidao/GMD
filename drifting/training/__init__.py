@@ -405,11 +405,12 @@ def create_trainer(
     )
     
     # Create cosine scheduler with warmup
+    import math
     def lr_lambda(step):
         if step < warmup_steps:
             return step / warmup_steps
         progress = (step - warmup_steps) / (total_steps - warmup_steps)
-        return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+        return 0.5 * (1 + torch.cos(torch.tensor(progress * math.pi)).item())
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     

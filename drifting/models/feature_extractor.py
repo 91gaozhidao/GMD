@@ -233,7 +233,10 @@ class LatentFeatureExtractor(nn.Module):
             in_ch = out_ch
             out_ch = min(out_ch * 2, 512)
         
-        self.feature_dims = [hidden_channels * (2 ** min(i, 3)) for i in range(num_stages)]
+        # Cap channel expansion at 2^3=8x to prevent excessive memory usage
+        # Feature dims: [hidden_channels, hidden_channels*2, hidden_channels*4, hidden_channels*8]
+        MAX_CHANNEL_DOUBLING = 3
+        self.feature_dims = [hidden_channels * (2 ** min(i, MAX_CHANNEL_DOUBLING)) for i in range(num_stages)]
     
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Extract multi-scale features."""
