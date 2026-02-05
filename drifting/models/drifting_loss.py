@@ -205,9 +205,11 @@ class DriftingLoss(nn.Module):
         
         for scale_idx, (feat_gen, feat_data) in enumerate(zip(feats_gen, feats_data)):
             # Get number of channels for temperature scaling (Paper Eq. 22)
+            # Features are 4D (B, C, H, W) at this point before normalization
+            # We use the channel count C for scaling: τ_l = τ / sqrt(C_l)
             num_channels = feat_gen.shape[1] if feat_gen.dim() == 4 else feat_gen.shape[-1]
             
-            # Normalize features
+            # Normalize features (converts from 4D to 2D via adaptive_avg_pool2d)
             feat_gen_norm = self.normalize_feature_map(feat_gen)
             feat_data_norm = self.normalize_feature_map(feat_data)
             
@@ -270,9 +272,11 @@ class DriftingLoss(nn.Module):
             zip(feats_gen, feats_data, feats_uncond)
         ):
             # Get number of channels for temperature scaling (Paper Eq. 22)
+            # Features are 4D (B, C, H, W) at this point before normalization
+            # We use the channel count C for scaling: τ_l = τ / sqrt(C_l)
             num_channels = feat_gen.shape[1] if feat_gen.dim() == 4 else feat_gen.shape[-1]
             
-            # Normalize features
+            # Normalize features (converts from 4D to 2D via adaptive_avg_pool2d)
             feat_gen_norm = self.normalize_feature_map(feat_gen)
             feat_data_norm = self.normalize_feature_map(feat_data)
             feat_uncond_norm = self.normalize_feature_map(feat_uncond)

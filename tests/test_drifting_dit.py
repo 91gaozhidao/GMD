@@ -41,9 +41,9 @@ class TestRMSNorm:
         norm = RMSNorm(dim=256)
         x = torch.randn(32, 10, 256) * 10  # Large input
         y = norm(x)
-        # With default weight=1, RMS should be approximately 1
+        # With default weight=1, RMS should be very close to 1.0
         rms = torch.sqrt((y ** 2).mean(dim=-1))
-        assert rms.mean().item() == pytest.approx(1.0, abs=0.1)
+        assert rms.mean().item() == pytest.approx(1.0, abs=0.01)
     
     def test_gradient_flow(self):
         """Test that gradients flow through normalization."""
@@ -53,6 +53,17 @@ class TestRMSNorm:
         loss = y.sum()
         loss.backward()
         assert x.grad is not None
+    
+    def test_no_elementwise_affine(self):
+        """Test RMSNorm without learnable weight (for AdaLN-Zero)."""
+        norm = RMSNorm(dim=256, elementwise_affine=False)
+        assert norm.weight is None
+        x = torch.randn(32, 10, 256) * 10
+        y = norm(x)
+        assert y.shape == x.shape
+        # RMS should still be approximately 1.0
+        rms = torch.sqrt((y ** 2).mean(dim=-1))
+        assert rms.mean().item() == pytest.approx(1.0, abs=0.01)
 
 
 class TestSwiGLU:

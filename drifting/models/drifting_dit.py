@@ -32,20 +32,28 @@ class RMSNorm(nn.Module):
     Args:
         dim: Dimension of the input features
         eps: Small epsilon for numerical stability
+        elementwise_affine: Whether to include learnable scale parameter (default: True)
     """
     
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
     
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         """Compute RMS normalization."""
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply RMS normalization with learnable scale."""
-        return self._norm(x.float()).type_as(x) * self.weight
+        """Apply RMS normalization with optional learnable scale."""
+        output = self._norm(x.float()).type_as(x)
+        if self.elementwise_affine and self.weight is not None:
+            output = output * self.weight
+        return output
 
 
 class SwiGLU(nn.Module):
@@ -139,12 +147,15 @@ class AdaLNZero(nn.Module):
     
     Used for conditioning on class labels and CFG scale.
     Outputs: (shift, scale, gate) for modulating layer outputs.
-    Uses RMSNorm per Paper Appendix A.2.
+    Uses RMSNorm per Paper Appendix A.2, without learnable affine parameters
+    to match the original LayerNorm(elementwise_affine=False) behavior.
     """
     
     def __init__(self, hidden_size: int, cond_size: int):
         super().__init__()
-        self.norm = RMSNorm(hidden_size)
+        # Use elementwise_affine=False to match original behavior
+        # The scale/shift are controlled by the AdaLN conditioning
+        self.norm = RMSNorm(hidden_size, elementwise_affine=False)
         self.linear = nn.Linear(cond_size, 6 * hidden_size)
         
         # Zero-initialize the linear layer
