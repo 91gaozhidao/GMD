@@ -229,7 +229,7 @@ def main():
         type=int,
         nargs="+",
         default=[1, 263],
-        help="Class IDs to generate (default: 1=goldfish, 263=Pembroke)",
+        help="Class IDs to generate (default: 1=goldfish, 263=Pembroke Welsh Corgi)",
     )
     parser.add_argument(
         "--cfg_scale",
