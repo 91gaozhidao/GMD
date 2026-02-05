@@ -260,7 +260,7 @@ def train(
         # Train one epoch
         metrics = trainer.train_epoch(
             dataloader=dataloader,
-            use_cfg_training=args.use_cfg_training,
+            use_cfg_training=not args.no_cfg_training,
             log_interval=args.log_interval,
         )
         
@@ -425,10 +425,9 @@ def main():
     
     # CFG arguments
     parser.add_argument(
-        "--use_cfg_training",
+        "--no_cfg_training",
         action="store_true",
-        default=True,
-        help="Use CFG-aware training (default: True)",
+        help="Disable CFG-aware training (default: CFG training is enabled)",
     )
     parser.add_argument(
         "--cfg_min",
