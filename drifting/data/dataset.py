@@ -382,17 +382,18 @@ class ClassGroupedBatchSampler(Sampler):
                     available_classes, 
                     size=self.num_classes_per_batch, 
                     replace=False
-                ).tolist()
+                )  # Keep as numpy array for efficiency
             else:
                 # If not enough classes, sample with replacement
                 selected_classes = self.rng.choice(
                     available_classes, 
                     size=self.num_classes_per_batch, 
                     replace=True
-                ).tolist()
+                )  # Keep as numpy array for efficiency
             
             # Sample M indices from each selected class
             for cls in selected_classes:
+                cls = int(cls)  # Convert numpy int to Python int once
                 indices = class_indices_copy[cls]
                 
                 if len(indices) >= self.samples_per_class:
@@ -406,8 +407,8 @@ class ClassGroupedBatchSampler(Sampler):
                         self.class_indices[cls], 
                         size=self.samples_per_class, 
                         replace=True
-                    ).tolist()
-                    batch.extend(sampled)
+                    )  # Keep as numpy array
+                    batch.extend(sampled.tolist())  # Convert only when extending
                 
                 # Refill if exhausted
                 if len(class_indices_copy[cls]) < self.samples_per_class:

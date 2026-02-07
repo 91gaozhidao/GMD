@@ -117,6 +117,56 @@ class DriftingTrainer:
                 model_param.data, alpha=1 - self.ema_decay
             )
     
+    def _scale_loss_for_accumulation(self, loss: torch.Tensor) -> torch.Tensor:
+        """
+        Scale loss for gradient accumulation.
+        
+        When using gradient accumulation, the loss needs to be divided by the
+        number of accumulation steps so that the effective gradient magnitude
+        remains the same as if using a larger batch size.
+        
+        Args:
+            loss: The computed loss tensor
+            
+        Returns:
+            Scaled loss tensor (loss / gradient_accumulation_steps)
+        """
+        return loss / self.gradient_accumulation_steps
+    
+    def _maybe_update_weights(self, is_accumulating: bool) -> float:
+        """
+        Conditionally update model weights after gradient accumulation.
+        
+        This method clips gradients, performs optimizer step, updates EMA,
+        and increments global step counter - but only when accumulation is complete.
+        
+        Args:
+            is_accumulating: If True, we're still accumulating gradients (no update)
+            
+        Returns:
+            Gradient norm value (0.0 if still accumulating)
+        """
+        grad_norm_value = 0.0
+        
+        if not is_accumulating:
+            # Gradient clipping for training stability
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            grad_norm_value = grad_norm.item()
+            
+            if grad_norm_value == 0.0:
+                warnings.warn("Gradient norm is 0.0 - model may not be learning!")
+            
+            # Update weights
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            
+            # Update EMA model
+            self._update_ema()
+            
+            self.global_step += 1
+        
+        return grad_norm_value
+    
     def train_step(
         self,
         x_data: torch.Tensor,
@@ -411,35 +461,22 @@ class DriftingTrainer:
             # Get positive samples from queue
             x_pos = self.sample_queue.sample(labels, num_samples=1)
             
-            # Compute drifting loss (scaled for accumulation)
-            loss = self.loss_fn(x_gen, x_pos) / self.gradient_accumulation_steps
+            # Compute drifting loss and scale for accumulation
+            loss = self.loss_fn(x_gen, x_pos)
+            scaled_loss = self._scale_loss_for_accumulation(loss)
         
         # Add unconditional samples to queue
         if uncond_mask.any():
             self.sample_queue.add_unconditional(x_data[uncond_mask])
         
         # Backward pass (accumulate gradients)
-        loss.backward()
+        scaled_loss.backward()
         
-        grad_norm_value = 0.0
-        if not is_accumulating:
-            # Only update weights after accumulation is complete
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            grad_norm_value = grad_norm.item()
-            
-            if grad_norm_value == 0.0:
-                warnings.warn("Gradient norm is 0.0 - model may not be learning!")
-            
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            
-            # Update EMA
-            self._update_ema()
-            
-            self.global_step += 1
+        # Conditionally update weights
+        grad_norm_value = self._maybe_update_weights(is_accumulating)
         
         return {
-            'loss': loss.item() * self.gradient_accumulation_steps,  # Report unscaled loss
+            'loss': loss.item(),  # Report unscaled loss
             'cfg_scale': cfg_scale,
             'uncond_ratio': uncond_mask.float().mean().item(),
             'grad_norm': grad_norm_value,
@@ -506,28 +543,17 @@ class DriftingTrainer:
             loss_uncond = self.loss_fn(x_gen_uncond, x_uncond)
             
             # Combine losses and scale for accumulation
-            total_loss = (loss + self.uncond_prob * loss_uncond) / self.gradient_accumulation_steps
+            total_loss = loss + self.uncond_prob * loss_uncond
+            scaled_loss = self._scale_loss_for_accumulation(total_loss)
         
         # Backward pass (accumulate gradients)
-        total_loss.backward()
+        scaled_loss.backward()
         
-        grad_norm_value = 0.0
-        if not is_accumulating:
-            # Only update weights after accumulation is complete
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            grad_norm_value = grad_norm.item()
-            
-            if grad_norm_value == 0.0:
-                warnings.warn("Gradient norm is 0.0 - model may not be learning!")
-            
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            
-            self._update_ema()
-            self.global_step += 1
+        # Conditionally update weights
+        grad_norm_value = self._maybe_update_weights(is_accumulating)
         
         return {
-            'loss': total_loss.item() * self.gradient_accumulation_steps,  # Report unscaled loss
+            'loss': total_loss.item(),  # Report unscaled loss
             'loss_cond': loss.item(),
             'loss_uncond': loss_uncond.item(),
             'cfg_scale': cfg_scale,
