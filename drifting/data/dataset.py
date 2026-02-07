@@ -7,15 +7,16 @@ enabling efficient training without VAE encoding during the training loop.
 Key classes:
 - LatentDataset: Load pre-cached latent files (batched or individual)
 - LatentDatasetIndividual: Load individually saved latent files
+- ClassGroupedBatchSampler: Sampler for class-grouped batches (Paper requirement)
 """
 
 import os
 from pathlib import Path
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Iterator
 import json
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import numpy as np
 
 
@@ -270,6 +271,161 @@ class DummyLatentDataset(Dataset):
         return self._num_classes
 
 
+class ClassGroupedBatchSampler(Sampler):
+    """
+    Class-Grouped Batch Sampler for Drifting Field training.
+    
+    This sampler enforces a specific batch structure where each batch contains
+    samples from a small number of classes, with many samples per class.
+    
+    This is crucial for single-GPU training because Drifting Field estimation
+    requires a high number of negative samples per class within a batch.
+    Random sampling on a single GPU (Batch=128) fails because samples per class << 1.
+    
+    Per Paper requirements:
+    - Select K classes per batch (e.g., K=4)
+    - Sample M images per class (e.g., M=32)
+    - Total Batch Size = K * M (e.g., 128)
+    
+    This ensures accurate drift estimation for the selected classes in each step.
+    
+    Args:
+        dataset: Dataset with labels accessible
+        num_classes_per_batch: Number of classes to include per batch (K)
+        samples_per_class: Number of samples per class (M)
+        num_classes: Total number of classes in dataset
+        drop_last: Whether to drop incomplete batches
+        seed: Random seed for reproducibility
+    """
+    
+    def __init__(
+        self,
+        dataset: Dataset,
+        num_classes_per_batch: int = 4,
+        samples_per_class: int = 32,
+        num_classes: int = 1000,
+        drop_last: bool = True,
+        seed: int = 42,
+    ):
+        self.dataset = dataset
+        self.num_classes_per_batch = num_classes_per_batch
+        self.samples_per_class = samples_per_class
+        self.num_classes = num_classes
+        self.drop_last = drop_last
+        self.batch_size = num_classes_per_batch * samples_per_class
+        
+        # Random state for reproducibility
+        self.rng = np.random.RandomState(seed)
+        
+        # Build class-to-indices mapping
+        self.class_indices = self._build_class_indices()
+        
+        # Calculate number of batches
+        self._num_batches = self._calculate_num_batches()
+    
+    def _build_class_indices(self) -> dict:
+        """Build a mapping from class labels to sample indices."""
+        class_indices = {c: [] for c in range(self.num_classes)}
+        
+        # Iterate through dataset to get labels
+        for idx in range(len(self.dataset)):
+            _, label = self.dataset[idx]
+            if isinstance(label, torch.Tensor):
+                label = label.item()
+            if 0 <= label < self.num_classes:
+                class_indices[label].append(idx)
+        
+        return class_indices
+    
+    def _calculate_num_batches(self) -> int:
+        """Calculate the number of batches based on available samples."""
+        # Count classes with enough samples
+        valid_classes = [
+            c for c, indices in self.class_indices.items()
+            if len(indices) >= self.samples_per_class
+        ]
+        
+        if len(valid_classes) < self.num_classes_per_batch:
+            # Fall back to classes with any samples
+            valid_classes = [c for c, indices in self.class_indices.items() if len(indices) > 0]
+        
+        # Estimate batches based on total samples
+        total_samples = sum(len(self.class_indices[c]) for c in valid_classes)
+        return max(1, total_samples // self.batch_size)
+    
+    def __iter__(self) -> Iterator[List[int]]:
+        """Generate batches of indices with class grouping."""
+        # Get classes with samples
+        available_classes = [
+            c for c, indices in self.class_indices.items()
+            if len(indices) > 0
+        ]
+        
+        if len(available_classes) == 0:
+            return
+        
+        # Shuffle available classes
+        self.rng.shuffle(available_classes)
+        
+        # Create local copy of indices for sampling without replacement within epoch
+        class_indices_copy = {c: list(indices) for c, indices in self.class_indices.items()}
+        for indices in class_indices_copy.values():
+            self.rng.shuffle(indices)
+        
+        batch_count = 0
+        while batch_count < self._num_batches:
+            batch = []
+            
+            # Select K random classes for this batch
+            if len(available_classes) >= self.num_classes_per_batch:
+                selected_classes = self.rng.choice(
+                    available_classes, 
+                    size=self.num_classes_per_batch, 
+                    replace=False
+                ).tolist()
+            else:
+                # If not enough classes, sample with replacement
+                selected_classes = self.rng.choice(
+                    available_classes, 
+                    size=self.num_classes_per_batch, 
+                    replace=True
+                ).tolist()
+            
+            # Sample M indices from each selected class
+            for cls in selected_classes:
+                indices = class_indices_copy[cls]
+                
+                if len(indices) >= self.samples_per_class:
+                    # Sample without replacement
+                    sampled = indices[:self.samples_per_class]
+                    class_indices_copy[cls] = indices[self.samples_per_class:]
+                    batch.extend(sampled)
+                else:
+                    # Sample with replacement if not enough
+                    sampled = self.rng.choice(
+                        self.class_indices[cls], 
+                        size=self.samples_per_class, 
+                        replace=True
+                    ).tolist()
+                    batch.extend(sampled)
+                
+                # Refill if exhausted
+                if len(class_indices_copy[cls]) < self.samples_per_class:
+                    class_indices_copy[cls] = list(self.class_indices[cls])
+                    self.rng.shuffle(class_indices_copy[cls])
+            
+            if len(batch) == self.batch_size:
+                yield batch
+                batch_count += 1
+            elif not self.drop_last and len(batch) > 0:
+                yield batch
+                batch_count += 1
+    
+    def __len__(self) -> int:
+        """Return the number of batches."""
+        return self._num_batches
+
+
 def create_dataloader(
     data_dir: str,
     batch_size: int = 64,
@@ -277,6 +433,11 @@ def create_dataloader(
     num_workers: int = 4,
     pin_memory: bool = True,
     drop_last: bool = True,
+    use_class_grouped_sampler: bool = False,
+    num_classes_per_batch: int = 4,
+    samples_per_class: int = 32,
+    num_classes: int = 1000,
+    seed: int = 42,
     **kwargs,
 ) -> DataLoader:
     """
@@ -284,11 +445,17 @@ def create_dataloader(
     
     Args:
         data_dir: Directory containing cached latents
-        batch_size: Batch size
-        shuffle: Whether to shuffle data
+        batch_size: Batch size (ignored if use_class_grouped_sampler=True)
+        shuffle: Whether to shuffle data (ignored if use_class_grouped_sampler=True)
         num_workers: Number of data loading workers
         pin_memory: Whether to pin memory for faster GPU transfer
         drop_last: Whether to drop the last incomplete batch
+        use_class_grouped_sampler: Whether to use class-grouped batch sampling
+                                   (recommended for single-GPU training)
+        num_classes_per_batch: Number of classes per batch (K) when using grouped sampler
+        samples_per_class: Samples per class (M) when using grouped sampler
+        num_classes: Total number of classes in dataset
+        seed: Random seed for reproducibility
         **kwargs: Additional arguments passed to LatentDataset
         
     Returns:
@@ -296,14 +463,32 @@ def create_dataloader(
     """
     dataset = LatentDataset(data_dir, **kwargs)
     
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-    )
+    if use_class_grouped_sampler:
+        # Use class-grouped batch sampler for Drifting Field training
+        batch_sampler = ClassGroupedBatchSampler(
+            dataset=dataset,
+            num_classes_per_batch=num_classes_per_batch,
+            samples_per_class=samples_per_class,
+            num_classes=num_classes,
+            drop_last=drop_last,
+            seed=seed,
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+    else:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+        )
 
 
 def create_dummy_dataloader(
@@ -312,6 +497,9 @@ def create_dummy_dataloader(
     batch_size: int = 64,
     latent_shape: Tuple[int, ...] = (4, 32, 32),
     seed: int = 42,
+    use_class_grouped_sampler: bool = False,
+    num_classes_per_batch: int = 4,
+    samples_per_class: int = 32,
     **kwargs,
 ) -> DataLoader:
     """
@@ -320,9 +508,12 @@ def create_dummy_dataloader(
     Args:
         num_samples: Number of dummy samples
         num_classes: Number of classes
-        batch_size: Batch size
+        batch_size: Batch size (ignored if use_class_grouped_sampler=True)
         latent_shape: Shape of latent tensors
         seed: Random seed
+        use_class_grouped_sampler: Whether to use class-grouped batch sampling
+        num_classes_per_batch: Number of classes per batch when using grouped sampler
+        samples_per_class: Samples per class when using grouped sampler
         **kwargs: Additional arguments passed to DataLoader
         
     Returns:
@@ -335,12 +526,30 @@ def create_dummy_dataloader(
         seed=seed,
     )
     
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=kwargs.pop('shuffle', True),
-        num_workers=kwargs.pop('num_workers', 0),  # Use 0 for dummy data
-        pin_memory=kwargs.pop('pin_memory', False),
-        drop_last=kwargs.pop('drop_last', True),
-        **kwargs,
-    )
+    if use_class_grouped_sampler:
+        batch_sampler = ClassGroupedBatchSampler(
+            dataset=dataset,
+            num_classes_per_batch=num_classes_per_batch,
+            samples_per_class=samples_per_class,
+            num_classes=num_classes,
+            drop_last=kwargs.pop('drop_last', True),
+            seed=seed,
+        )
+        
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=kwargs.pop('num_workers', 0),
+            pin_memory=kwargs.pop('pin_memory', False),
+            **kwargs,
+        )
+    else:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=kwargs.pop('shuffle', True),
+            num_workers=kwargs.pop('num_workers', 0),  # Use 0 for dummy data
+            pin_memory=kwargs.pop('pin_memory', False),
+            drop_last=kwargs.pop('drop_last', True),
+            **kwargs,
+        )

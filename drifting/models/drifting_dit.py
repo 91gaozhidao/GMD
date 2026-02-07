@@ -384,7 +384,8 @@ class DriftingDiT(nn.Module):
     - Patch embedding for latent images
     - DiT transformer blocks with AdaLN-Zero conditioning
     - SwiGLU activations, RoPE, QK-Norm
-    - Style tokens for additional randomness
+    - Style tokens for additional randomness (Paper Appendix A.2)
+    - In-context Register tokens for conditioning (Paper Appendix A.2)
     
     Args:
         img_size: Size of the latent image (default: 32 for ImageNet VAE)
@@ -396,6 +397,9 @@ class DriftingDiT(nn.Module):
         num_heads: Number of attention heads (default: 12)
         mlp_ratio: MLP hidden dimension ratio (default: 4.0)
         num_style_tokens: Number of learnable style tokens (default: 32)
+        num_register_tokens: Number of in-context register tokens (default: 16, Paper A.2)
+        codebook_size: Size of style codebook (default: 64, Paper A.2)
+        num_style_samples: Number of style samples to sum (default: 32, Paper A.2)
         dropout: Dropout rate (default: 0.0)
     """
     
@@ -410,6 +414,9 @@ class DriftingDiT(nn.Module):
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         num_style_tokens: int = 32,
+        num_register_tokens: int = 16,
+        codebook_size: int = 64,
+        num_style_samples: int = 32,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -419,6 +426,9 @@ class DriftingDiT(nn.Module):
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.num_patches = (img_size // patch_size) ** 2
+        self.num_register_tokens = num_register_tokens
+        self.codebook_size = codebook_size
+        self.num_style_samples = num_style_samples
         
         # Patch embedding
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
@@ -433,7 +443,19 @@ class DriftingDiT(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         
-        # Style tokens
+        # In-context Register Tokens (Paper Appendix A.2)
+        # These are prepended to the patch sequence for conditioning
+        self.register_tokens = nn.Parameter(torch.randn(1, num_register_tokens, embed_dim) * 0.02)
+        
+        # Projection layer to project global conditioning to register token shape
+        # Projects from embed_dim to (num_register_tokens * embed_dim)
+        self.register_proj = nn.Linear(embed_dim, num_register_tokens * embed_dim)
+        
+        # Style Tokens Codebook (Paper Appendix A.2 - redesigned)
+        # Instead of selecting 1 from 32, we now sample 32 from 64 and sum
+        self.style_codebook = nn.Parameter(torch.randn(codebook_size, embed_dim) * 0.02)
+        
+        # Legacy style tokens for backward compatibility
         self.style_tokens = StyleTokens(num_style_tokens, embed_dim)
         
         # Conditioning size: Paper Appendix A.2 specifies element-wise sum
@@ -469,20 +491,35 @@ class DriftingDiT(nn.Module):
         # Initialize class embedding
         nn.init.normal_(self.class_embed.weight, std=0.02)
         
+        # Initialize register tokens (Paper A.2)
+        nn.init.normal_(self.register_tokens, std=0.02)
+        
+        # Initialize register projection
+        nn.init.normal_(self.register_proj.weight, std=0.02)
+        nn.init.zeros_(self.register_proj.bias)
+        
+        # Initialize style codebook (Paper A.2)
+        nn.init.normal_(self.style_codebook, std=0.02)
+        
         # Initialize final projection to zero (for stable training start)
         nn.init.zeros_(self.final_proj.weight)
         nn.init.zeros_(self.final_proj.bias)
     
-    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+    def unpatchify(self, x: torch.Tensor, num_register_tokens: int = 0) -> torch.Tensor:
         """
         Convert patch predictions back to image.
         
         Args:
-            x: Patch predictions of shape (B, N, P*P*C)
+            x: Patch predictions of shape (B, N, P*P*C) where N may include register tokens
+            num_register_tokens: Number of register tokens to skip at the beginning
             
         Returns:
             Image tensor of shape (B, C, H, W)
         """
+        # Skip register tokens if present
+        if num_register_tokens > 0:
+            x = x[:, num_register_tokens:, :]
+        
         p = self.patch_size
         h = w = int(x.shape[1] ** 0.5)
         c = self.in_chans
@@ -517,7 +554,7 @@ class DriftingDiT(nn.Module):
         device = z.device
         
         # Patch embed the noise
-        x = self.patch_embed(z)  # (B, N, D)
+        x = self.patch_embed(z)  # (B, N, D) where N = num_patches
         
         # Get class embedding
         class_emb = self.class_embed(y)  # (B, D)
@@ -526,16 +563,40 @@ class DriftingDiT(nn.Module):
         cfg_tensor = torch.full((B, 1), cfg_scale, device=device, dtype=z.dtype)
         cfg_emb = self.cfg_embed(cfg_tensor)  # (B, D)
         
-        # Get style token embedding
+        # Get style token embedding using new codebook (Paper Appendix A.2)
+        # Sample 32 random indices with replacement from [0, 64) for each sample
         if use_style_tokens:
-            style_emb = self.style_tokens.get_mixed(B, device)  # (B, D)
+            # Sample num_style_samples indices from codebook
+            indices = torch.randint(
+                0, self.codebook_size, 
+                (B, self.num_style_samples), 
+                device=device
+            )  # (B, num_style_samples)
+            
+            # Gather the vectors from codebook
+            style_vectors = self.style_codebook[indices]  # (B, num_style_samples, D)
+            
+            # Sum along the sample dimension to get single vector
+            style_emb = style_vectors.sum(dim=1)  # (B, D)
         else:
             style_emb = torch.zeros(B, self.embed_dim, device=device, dtype=z.dtype)
         
-        # Element-wise sum for conditioning (Paper Appendix A.2)
+        # Element-wise sum for global conditioning (Paper Appendix A.2)
         # "These are summed and added to the conditioning vector... 
         # introduces negligible overhead"
         cond = class_emb + cfg_emb + style_emb  # (B, D)
+        
+        # Create In-context Register Tokens (Paper Appendix A.2)
+        # 1. Project global conditioning to register token shape
+        register_cond = self.register_proj(cond)  # (B, num_register_tokens * D)
+        register_cond = register_cond.view(B, self.num_register_tokens, self.embed_dim)  # (B, 16, D)
+        
+        # 2. Add to base register tokens (expanded to batch)
+        register_tokens = self.register_tokens.expand(B, -1, -1) + register_cond  # (B, 16, D)
+        
+        # 3. Concatenate register tokens to front of patch embeddings
+        # New sequence length = num_register_tokens + num_patches
+        x = torch.cat([register_tokens, x], dim=1)  # (B, 16 + N, D)
         
         # Apply transformer blocks
         for block in self.blocks:
@@ -543,10 +604,10 @@ class DriftingDiT(nn.Module):
         
         # Final projection
         x = self.final_norm(x)
-        x = self.final_proj(x)  # (B, N, P*P*C)
+        x = self.final_proj(x)  # (B, 16 + N, P*P*C)
         
-        # Unpatchify
-        out = self.unpatchify(x)  # (B, C, H, W)
+        # Unpatchify (skip register tokens)
+        out = self.unpatchify(x, num_register_tokens=self.num_register_tokens)  # (B, C, H, W)
         
         return out
     

@@ -329,6 +329,62 @@ class TestDriftingDiT:
                 f"Expected cond_size={expected_in_features} (element-wise sum), "
                 f"got {actual_in_features}. Paper specifies summing embeddings."
             )
+    
+    def test_register_tokens_exist(self):
+        """Test that register tokens are properly initialized (Paper Appendix A.2)."""
+        model = DriftingDiTSmall(
+            img_size=32, patch_size=2, in_chans=4,
+            num_classes=10, num_register_tokens=16
+        )
+        
+        # Check register tokens parameter exists with correct shape
+        assert hasattr(model, 'register_tokens')
+        assert model.register_tokens.shape == (1, 16, model.embed_dim)
+        assert model.register_tokens.requires_grad
+        
+    def test_register_proj_exists(self):
+        """Test that register projection layer exists."""
+        model = DriftingDiTSmall(
+            img_size=32, patch_size=2, in_chans=4,
+            num_classes=10, num_register_tokens=16
+        )
+        
+        # Check register projection layer exists
+        assert hasattr(model, 'register_proj')
+        assert model.register_proj.in_features == model.embed_dim
+        assert model.register_proj.out_features == 16 * model.embed_dim
+        
+    def test_style_codebook_exists(self):
+        """Test that style codebook is properly initialized (Paper Appendix A.2)."""
+        model = DriftingDiTSmall(
+            img_size=32, patch_size=2, in_chans=4,
+            num_classes=10, codebook_size=64, num_style_samples=32
+        )
+        
+        # Check style codebook parameter exists with correct shape
+        assert hasattr(model, 'style_codebook')
+        assert model.style_codebook.shape == (64, model.embed_dim)
+        assert model.style_codebook.requires_grad
+        assert model.num_style_samples == 32
+        
+    def test_sequence_length_with_registers(self):
+        """Test that forward pass handles sequence length correctly with register tokens."""
+        num_register_tokens = 16
+        img_size = 32
+        patch_size = 2
+        num_patches = (img_size // patch_size) ** 2  # 256
+        
+        model = DriftingDiTSmall(
+            img_size=img_size, patch_size=patch_size, in_chans=4,
+            num_classes=10, num_register_tokens=num_register_tokens
+        )
+        
+        z = torch.randn(4, 4, img_size, img_size)
+        y = torch.randint(0, 10, (4,))
+        out = model(z, y, cfg_scale=1.0)
+        
+        # Output should have the same shape as input (registers are removed in unpatchify)
+        assert out.shape == z.shape
 
 
 class TestDriftingDiTMemory:

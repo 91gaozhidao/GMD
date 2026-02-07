@@ -186,6 +186,9 @@ def train(
             batch_size=args.batch_size,
             latent_shape=(args.in_channels, args.latent_size, args.latent_size),
             seed=args.seed or 42,
+            use_class_grouped_sampler=args.use_class_grouped_sampler,
+            num_classes_per_batch=args.num_classes_per_batch,
+            samples_per_class=args.sampler_samples_per_class,
         )
         num_samples = args.num_dummy_samples
     else:
@@ -193,14 +196,31 @@ def train(
         dataloader = create_dataloader(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=not args.use_class_grouped_sampler,  # Disable shuffle when using grouped sampler
             num_workers=args.num_workers,
             pin_memory=device == "cuda",
+            use_class_grouped_sampler=args.use_class_grouped_sampler,
+            num_classes_per_batch=args.num_classes_per_batch,
+            samples_per_class=args.sampler_samples_per_class,
+            num_classes=args.num_classes,
+            seed=args.seed or 42,
         )
         num_samples = len(dataloader.dataset)
     
+    # Compute effective batch size
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    if args.use_class_grouped_sampler:
+        physical_batch_size = args.num_classes_per_batch * args.sampler_samples_per_class
+        effective_batch_size = physical_batch_size * args.gradient_accumulation_steps
+        print(f"\nClass-Grouped Sampling enabled:")
+        print(f"  Classes per batch (K): {args.num_classes_per_batch}")
+        print(f"  Samples per class (M): {args.sampler_samples_per_class}")
+        print(f"  Physical batch size (K*M): {physical_batch_size}")
+    
     print(f"Dataset size: {num_samples} samples")
     print(f"Batch size: {args.batch_size}")
+    print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {effective_batch_size}")
     print(f"Batches per epoch: {len(dataloader)}")
     
     # Create model
@@ -235,6 +255,7 @@ def train(
         latent_shape=(args.in_channels, args.latent_size, args.latent_size),
         ema_decay=args.ema_decay,
         mae_checkpoint=args.mae_checkpoint,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     
     # Resume from checkpoint if specified
@@ -426,6 +447,31 @@ def main():
         default=0.9999,
         help="EMA decay rate (default: 0.9999)",
     )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=32,
+        help="Gradient accumulation steps for effective batch size (default: 32 for ~4096 effective batch)",
+    )
+    
+    # Class-grouped sampling arguments (for single-GPU training)
+    parser.add_argument(
+        "--use_class_grouped_sampler",
+        action="store_true",
+        help="Enable class-grouped batch sampling (recommended for single-GPU training)",
+    )
+    parser.add_argument(
+        "--num_classes_per_batch",
+        type=int,
+        default=4,
+        help="Number of classes per batch when using class-grouped sampler (K, default: 4)",
+    )
+    parser.add_argument(
+        "--sampler_samples_per_class",
+        type=int,
+        default=32,
+        help="Number of samples per class when using class-grouped sampler (M, default: 32)",
+    )
     
     # CFG arguments
     parser.add_argument(
@@ -456,14 +502,15 @@ def main():
     parser.add_argument(
         "--feature_extractor",
         type=str,
-        default="latent",
-        help="Feature extractor type (default: latent)",
+        default="mae",
+        help="Feature extractor type: 'mae' (recommended, requires --mae_checkpoint) or 'latent' (default: mae)",
     )
     parser.add_argument(
         "--mae_checkpoint",
         type=str,
         default=None,
-        help="Path to pretrained MAE encoder checkpoint for feature extractor",
+        help="Path to pretrained MAE encoder checkpoint for feature extractor. "
+             "Required when using --feature_extractor=mae (paper states training without MAE does not converge)",
     )
     
     # Queue arguments
@@ -553,6 +600,16 @@ def main():
     # Validate arguments
     if not args.dummy and args.data_dir is None:
         parser.error("Either --data_dir or --dummy must be specified")
+    
+    # Validate MAE checkpoint requirement
+    # Paper states that training on raw latents without MAE does not converge
+    if args.feature_extractor == "mae" and args.mae_checkpoint is None:
+        parser.error(
+            "When using --feature_extractor=mae (default), you must provide --mae_checkpoint. "
+            "Per paper Appendix A.3: training on raw latents without a pretrained MAE encoder "
+            "does not converge. Either provide an MAE checkpoint or use --feature_extractor=latent "
+            "(not recommended for production training)."
+        )
     
     # Run training
     train(args)
