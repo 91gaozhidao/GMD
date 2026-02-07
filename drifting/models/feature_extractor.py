@@ -17,26 +17,37 @@ from typing import List, Optional, Tuple
 import torchvision.models as models
 
 
+def _make_norm(channels: int, num_groups: int = 32) -> nn.Module:
+    """Create a GroupNorm layer with a safe number of groups.
+
+    If *channels* is not divisible by *num_groups*, fall back to a smaller
+    divisor so that the layer can still be instantiated.
+    """
+    while num_groups > 1 and channels % num_groups != 0:
+        num_groups //= 2
+    return nn.GroupNorm(num_groups, channels)
+
+
 class ResNetBlock(nn.Module):
-    """Basic ResNet block with skip connection."""
+    """Basic ResNet block with skip connection and GroupNorm (Paper A.3)."""
     
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.gn1 = _make_norm(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.gn2 = _make_norm(out_channels)
         
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels)
+                _make_norm(out_channels)
             )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
         out = out + self.shortcut(x)
         out = F.relu(out)
         return out
@@ -100,7 +111,7 @@ class FeatureExtractor(nn.Module):
         else:
             self.input_conv = resnet.conv1
         
-        self.bn1 = resnet.bn1
+        self.norm1 = resnet.bn1
         self.relu = resnet.relu
         self.maxpool = resnet.maxpool
         
@@ -124,9 +135,9 @@ class FeatureExtractor(nn.Module):
                     param.requires_grad = True
     
     def _build_custom(self, in_channels: int, base_channels: int, num_blocks: List[int]):
-        """Build a custom ResNet-style encoder."""
+        """Build a custom ResNet-style encoder with GroupNorm (Paper A.3)."""
         self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(base_channels)
+        self.norm1 = _make_norm(base_channels)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
@@ -159,7 +170,7 @@ class FeatureExtractor(nn.Module):
         """
         # Initial processing
         x = self.input_conv(x)
-        x = self.bn1(x)
+        x = self.norm1(x)
         x = self.relu(x)
         x = self.maxpool(x)
         

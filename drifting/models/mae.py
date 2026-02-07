@@ -27,11 +27,23 @@ from typing import List, Tuple, Optional
 import math
 
 
+def _make_norm(channels: int, num_groups: int = 32) -> nn.Module:
+    """Create a GroupNorm layer with a safe number of groups.
+
+    If *channels* is not divisible by *num_groups*, fall back to a smaller
+    divisor so that the layer can still be instantiated.
+    """
+    while num_groups > 1 and channels % num_groups != 0:
+        num_groups //= 2
+    return nn.GroupNorm(num_groups, channels)
+
+
 class BasicBlock(nn.Module):
     """
     Basic ResNet block with skip connection (Paper Appendix A.3).
     
-    Two conv layers with BatchNorm and ReLU, plus a residual shortcut.
+    Two conv layers with GroupNorm and ReLU, plus a residual shortcut.
+    Per paper Appendix A.3: "GroupNorm (GN) in place of BatchNorm".
     
     Args:
         in_channels: Number of input channels
@@ -42,20 +54,20 @@ class BasicBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.gn1 = _make_norm(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.gn2 = _make_norm(out_channels)
         
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels)
+                _make_norm(out_channels)
             )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
         out = out + self.shortcut(x)
         out = F.relu(out)
         return out
@@ -203,24 +215,24 @@ class LatentMAEDecoder(nn.Module):
         self.start_size = start_size
         self.hidden_channels = hidden_channels
         
-        # Upsample decoder blocks
+        # Upsample decoder blocks (using GroupNorm per paper A.3)
         self.decoder_blocks = nn.ModuleList([
             # 4x4 -> 8x8
             nn.Sequential(
                 nn.ConvTranspose2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(hidden_channels),
+                _make_norm(hidden_channels),
                 nn.ReLU(inplace=True),
             ),
             # 8x8 -> 16x16
             nn.Sequential(
                 nn.ConvTranspose2d(hidden_channels, hidden_channels // 2, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(hidden_channels // 2),
+                _make_norm(hidden_channels // 2),
                 nn.ReLU(inplace=True),
             ),
             # 16x16 -> 32x32
             nn.Sequential(
                 nn.ConvTranspose2d(hidden_channels // 2, hidden_channels // 4, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(hidden_channels // 4),
+                _make_norm(hidden_channels // 4),
                 nn.ReLU(inplace=True),
             ),
         ])

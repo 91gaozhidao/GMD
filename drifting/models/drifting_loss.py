@@ -94,17 +94,17 @@ class DriftingLoss(nn.Module):
         Freeze the feature extractor for training.
         
         CRITICAL for single-GPU training with Class-Grouped Sampling (Paper requirement):
-        - Sets feature extractor to eval() mode to disable BatchNorm running stats updates
+        - Sets feature extractor to eval() mode
         - Sets requires_grad=False for all parameters to prevent gradient computation
         
-        This MUST be called when using pretrained MAE encoder to prevent:
-        1. BatchNorm statistics corruption from class-grouped batches
-        2. Unintended updates to feature extractor weights during training
+        This MUST be called when using pretrained MAE encoder to prevent
+        unintended updates to feature extractor weights during training.
         
-        Per Paper review: "Feature Extractor (MAE) MUST be in .eval() mode with 
-        requires_grad=False to prevent BatchNorm statistics pollution from grouped batches."
+        Note: The feature extractor uses GroupNorm (per paper A.3), which has no
+        running statistics, making it inherently safe against batch stat corruption.
+        However, freezing is still required to prevent weight updates.
         """
-        # Set to eval mode - critical for BatchNorm layers
+        # Set to eval mode
         self.feature_extractor.eval()
         
         # Freeze all parameters
