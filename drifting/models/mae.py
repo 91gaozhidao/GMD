@@ -7,12 +7,15 @@ in the paper's Appendix A.3:
 > "We use a ResNet-style network... pre-trained with **Masked Autoencoding (MAE)**... 
 > on the VAE latent space."
 > "We found it crucial to use a feature extractor... raw pixels/latents failed."
+> "All residual blocks are 'basic' blocks"
+> "ResNet-style encoder... blocks/stage [3, 4, 6, 3]"
 
 The pretrained encoder provides a structured feature space for computing
 the drifting field, which is essential for achieving SOTA performance.
 
 Key components:
-- LatentMAEEncoder: Encoder backbone (based on LatentFeatureExtractor architecture)
+- BasicBlock: Standard ResNet basic block with skip connection
+- LatentMAEEncoder: ResNet-style encoder backbone with configurable blocks per stage
 - LatentMAEDecoder: Lightweight decoder for reconstruction
 - LatentMAE: Full MAE model with masking, encoding, and decoding
 """
@@ -24,22 +27,53 @@ from typing import List, Tuple, Optional
 import math
 
 
-# Maximum number of channel doublings to prevent excessive memory usage
-_MAX_CHANNEL_DOUBLING = 3
+class BasicBlock(nn.Module):
+    """
+    Basic ResNet block with skip connection (Paper Appendix A.3).
+    
+    Two conv layers with BatchNorm and ReLU, plus a residual shortcut.
+    
+    Args:
+        in_channels: Number of input channels
+        out_channels: Number of output channels
+        stride: Stride for the first convolution (for downsampling)
+    """
+    
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + self.shortcut(x)
+        out = F.relu(out)
+        return out
 
 
 class LatentMAEEncoder(nn.Module):
     """
-    Encoder for Latent MAE, based on LatentFeatureExtractor architecture.
+    ResNet-style Encoder for Latent MAE (Paper Appendix A.3 & Table 8).
     
-    This encoder processes visible (unmasked) patches and produces
-    feature representations for reconstruction.
+    Uses BasicBlock residual blocks with configurable blocks per stage.
+    Channel widths expand naturally without artificial caps.
     
     Args:
         in_channels: Number of input channels (default: 4 for VAE latent)
-        hidden_channels: Base hidden dimension (default: 64)
+        hidden_channels: Base hidden dimension / base width (default: 64)
         num_stages: Number of encoder stages (default: 4)
         patch_size: Patch size for masking (default: 4)
+        blocks_per_stage: Number of BasicBlocks per stage (default: [3, 4, 6, 3] for L/2)
     """
     
     def __init__(
@@ -48,6 +82,7 @@ class LatentMAEEncoder(nn.Module):
         hidden_channels: int = 64,
         num_stages: int = 4,
         patch_size: int = 4,
+        blocks_per_stage: Optional[List[int]] = None,
     ):
         super().__init__()
         
@@ -56,27 +91,38 @@ class LatentMAEEncoder(nn.Module):
         self.num_stages = num_stages
         self.patch_size = patch_size
         
-        # Build encoder stages
+        if blocks_per_stage is None:
+            blocks_per_stage = [3, 4, 6, 3]
+        
+        # Ensure blocks_per_stage matches num_stages
+        if len(blocks_per_stage) < num_stages:
+            blocks_per_stage = blocks_per_stage + [blocks_per_stage[-1]] * (num_stages - len(blocks_per_stage))
+        blocks_per_stage = blocks_per_stage[:num_stages]
+        self.blocks_per_stage = blocks_per_stage
+        
+        # Build encoder stages with proper ResNet BasicBlocks
         self.stages = nn.ModuleList()
+        
+        # Feature dimensions at each stage (natural expansion, no cap)
+        self.feature_dims = []
         
         in_ch = in_channels
         out_ch = hidden_channels
         
         for i in range(num_stages):
-            stage = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2 if i > 0 else 1, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            )
-            self.stages.append(stage)
+            stride = 2 if i > 0 else 1
+            num_blocks = blocks_per_stage[i]
+            
+            # Build stage: first block handles channel change & downsampling
+            blocks = [BasicBlock(in_ch, out_ch, stride=stride)]
+            for _ in range(1, num_blocks):
+                blocks.append(BasicBlock(out_ch, out_ch, stride=1))
+            
+            self.stages.append(nn.Sequential(*blocks))
+            self.feature_dims.append(out_ch)
+            
             in_ch = out_ch
-            out_ch = min(out_ch * 2, 512)
-        
-        # Feature dimensions at each stage
-        self.feature_dims = [hidden_channels * (2 ** min(i, _MAX_CHANNEL_DOUBLING)) for i in range(num_stages)]
+            out_ch = out_ch * 2  # Natural channel expansion, no cap
         
         # Final feature dimension (after global average pooling)
         self.final_dim = self.feature_dims[-1]
@@ -216,6 +262,10 @@ class LatentMAE(nn.Module):
     The encoder learns to extract meaningful features from latent representations
     by reconstructing masked patches.
     
+    Supports two training modes:
+    1. Reconstruction (MAE pretraining): Mask patches, reconstruct, MSE loss
+    2. Classification fine-tuning: Add linear head, CrossEntropy loss (Appendix A.3)
+    
     Masking Strategy:
     - Divide input into non-overlapping patches
     - Randomly mask 75% of patches (following original MAE paper)
@@ -225,11 +275,13 @@ class LatentMAE(nn.Module):
     
     Args:
         in_channels: Number of latent channels (default: 4 for SD-VAE)
-        hidden_channels: Encoder hidden dimension (default: 64)
+        hidden_channels: Encoder hidden dimension / base width (default: 64)
         num_stages: Number of encoder stages (default: 4)
         patch_size: Patch size for masking (default: 4)
         mask_ratio: Ratio of patches to mask (default: 0.75)
         input_size: Spatial size of input (default: 32)
+        blocks_per_stage: Number of BasicBlocks per stage (default: [3, 4, 6, 3])
+        num_classes: Number of classes for classification head (default: 1000)
     """
     
     def __init__(
@@ -240,6 +292,8 @@ class LatentMAE(nn.Module):
         patch_size: int = 4,
         mask_ratio: float = 0.75,
         input_size: int = 32,
+        blocks_per_stage: Optional[List[int]] = None,
+        num_classes: int = 1000,
     ):
         super().__init__()
         
@@ -253,12 +307,13 @@ class LatentMAE(nn.Module):
         self.num_patches_per_dim = input_size // patch_size
         self.num_patches = self.num_patches_per_dim ** 2
         
-        # Encoder
+        # Encoder (ResNet-style with configurable blocks per stage)
         self.encoder = LatentMAEEncoder(
             in_channels=in_channels,
             hidden_channels=hidden_channels,
             num_stages=num_stages,
             patch_size=patch_size,
+            blocks_per_stage=blocks_per_stage,
         )
         
         # Decoder
@@ -268,6 +323,9 @@ class LatentMAE(nn.Module):
             hidden_channels=256,
             output_size=input_size,
         )
+        
+        # Classification head for fine-tuning (Paper Appendix A.3, Table 3)
+        self.classifier_head = nn.Linear(self.encoder.final_dim, num_classes)
         
         # Mask token for masked patches
         self.mask_token = nn.Parameter(torch.zeros(1, in_channels, 1, 1))
@@ -441,6 +499,22 @@ class LatentMAE(nn.Module):
         """
         _, features = self.encoder(x)
         return self.decoder(features)
+    
+    def forward_cls(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Classification forward pass (Paper Appendix A.3, Table 3).
+        
+        Passes input through encoder and classification head without masking.
+        Used during classification fine-tuning phase.
+        
+        Args:
+            x: Input latent of shape (B, C, H, W)
+            
+        Returns:
+            Class logits of shape (B, num_classes)
+        """
+        _, pooled = self.encoder(x)
+        return self.classifier_head(pooled)
 
 
 def create_mae(
@@ -450,17 +524,21 @@ def create_mae(
     patch_size: int = 4,
     mask_ratio: float = 0.75,
     input_size: int = 32,
+    blocks_per_stage: Optional[List[int]] = None,
+    num_classes: int = 1000,
 ) -> LatentMAE:
     """
     Factory function to create a LatentMAE model.
     
     Args:
         in_channels: Number of latent channels (default: 4)
-        hidden_channels: Encoder hidden dimension (default: 64)
+        hidden_channels: Encoder hidden dimension / base width (default: 64)
         num_stages: Number of encoder stages (default: 4)
         patch_size: Patch size for masking (default: 4)
         mask_ratio: Ratio of patches to mask (default: 0.75)
         input_size: Spatial size of input (default: 32)
+        blocks_per_stage: BasicBlocks per stage (default: [3, 4, 6, 3])
+        num_classes: Number of classes for classification head (default: 1000)
         
     Returns:
         Configured LatentMAE model
@@ -472,4 +550,6 @@ def create_mae(
         patch_size=patch_size,
         mask_ratio=mask_ratio,
         input_size=input_size,
+        blocks_per_stage=blocks_per_stage,
+        num_classes=num_classes,
     )

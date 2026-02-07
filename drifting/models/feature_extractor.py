@@ -205,12 +205,14 @@ class LatentFeatureExtractor(nn.Module):
     Lightweight feature extractor for VAE latent space.
     
     Since the latent space is already a good representation,
-    we use a simpler encoder that's faster to compute.
+    we use a ResNet-style encoder with BasicBlocks.
     
     This encoder can be pretrained using MAE (Masked Autoencoding) as described
     in the paper's Appendix A.3:
     > "We use a ResNet-style network... pre-trained with MAE... on the VAE latent space."
     > "We found it crucial to use a feature extractor... raw pixels/latents failed."
+    > "All residual blocks are 'basic' blocks"
+    > "ResNet-style encoder... blocks/stage [3, 4, 6, 3]"
     """
     
     def __init__(
@@ -218,6 +220,7 @@ class LatentFeatureExtractor(nn.Module):
         in_channels: int = 4,
         hidden_channels: int = 64,
         num_stages: int = 4,
+        blocks_per_stage: Optional[List[int]] = None,
     ):
         super().__init__()
         
@@ -226,26 +229,34 @@ class LatentFeatureExtractor(nn.Module):
         self.num_stages = num_stages
         self.stages = nn.ModuleList()
         
+        if blocks_per_stage is None:
+            blocks_per_stage = [3, 4, 6, 3]
+        
+        # Ensure blocks_per_stage matches num_stages
+        if len(blocks_per_stage) < num_stages:
+            blocks_per_stage = blocks_per_stage + [blocks_per_stage[-1]] * (num_stages - len(blocks_per_stage))
+        blocks_per_stage = blocks_per_stage[:num_stages]
+        
         in_ch = in_channels
         out_ch = hidden_channels
         
-        for i in range(num_stages):
-            stage = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2 if i > 0 else 1, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            )
-            self.stages.append(stage)
-            in_ch = out_ch
-            out_ch = min(out_ch * 2, 512)
+        # Feature dims: natural channel expansion, no artificial cap
+        self.feature_dims = []
         
-        # Cap channel expansion at 2^3=8x to prevent excessive memory usage
-        # Feature dims: [hidden_channels, hidden_channels*2, hidden_channels*4, hidden_channels*8]
-        MAX_CHANNEL_DOUBLING = 3
-        self.feature_dims = [hidden_channels * (2 ** min(i, MAX_CHANNEL_DOUBLING)) for i in range(num_stages)]
+        for i in range(num_stages):
+            stride = 2 if i > 0 else 1
+            num_blocks = blocks_per_stage[i]
+            
+            # Build stage with ResNet BasicBlocks
+            blocks = [ResNetBlock(in_ch, out_ch, stride=stride)]
+            for _ in range(1, num_blocks):
+                blocks.append(ResNetBlock(out_ch, out_ch, stride=1))
+            
+            self.stages.append(nn.Sequential(*blocks))
+            self.feature_dims.append(out_ch)
+            
+            in_ch = out_ch
+            out_ch = out_ch * 2  # Natural expansion, no cap
     
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Extract multi-scale features."""
