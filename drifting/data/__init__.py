@@ -5,6 +5,7 @@ from .dataset import (
     LatentDataset,
     LatentDatasetIndividual,
     DummyLatentDataset,
+    ClassGroupedBatchSampler,
     create_dataloader,
     create_dummy_dataloader,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "LatentDataset",
     "LatentDatasetIndividual",
     "DummyLatentDataset",
+    "ClassGroupedBatchSampler",
     "create_dataloader",
     "create_dummy_dataloader",
 ]

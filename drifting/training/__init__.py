@@ -33,6 +33,8 @@ class DriftingTrainer:
     - Sample queue for positive attractors
     - Stop-gradient for fixed-point iteration
     - Training-time CFG with unconditional samples
+    - Gradient accumulation for effective batch size
+    - BF16 mixed precision for A100 optimization
     
     Args:
         model: DriftingDiT generator model
@@ -46,6 +48,7 @@ class DriftingTrainer:
         uncond_prob: Probability of using unconditional training
         latent_shape: Shape of latent samples (C, H, W)
         ema_decay: EMA decay for model weights (0 to disable)
+        gradient_accumulation_steps: Number of steps to accumulate gradients (default: 1)
     """
     
     def __init__(
@@ -61,6 +64,7 @@ class DriftingTrainer:
         uncond_prob: float = 0.1,
         latent_shape: tuple = (4, 32, 32),
         ema_decay: float = 0.9999,
+        gradient_accumulation_steps: int = 1,
     ):
         self.model = model.to(device)
         self.loss_fn = loss_fn.to(device)
@@ -68,6 +72,7 @@ class DriftingTrainer:
         self.scheduler = scheduler
         self.device = device
         self.cfg_scale_range = cfg_scale_range
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.uncond_prob = uncond_prob
         self.latent_shape = latent_shape
         
@@ -111,6 +116,56 @@ class DriftingTrainer:
             ema_param.data.mul_(self.ema_decay).add_(
                 model_param.data, alpha=1 - self.ema_decay
             )
+    
+    def _scale_loss_for_accumulation(self, loss: torch.Tensor) -> torch.Tensor:
+        """
+        Scale loss for gradient accumulation.
+        
+        When using gradient accumulation, the loss needs to be divided by the
+        number of accumulation steps so that the effective gradient magnitude
+        remains the same as if using a larger batch size.
+        
+        Args:
+            loss: The computed loss tensor
+            
+        Returns:
+            Scaled loss tensor (loss / gradient_accumulation_steps)
+        """
+        return loss / self.gradient_accumulation_steps
+    
+    def _maybe_update_weights(self, is_accumulating: bool) -> float:
+        """
+        Conditionally update model weights after gradient accumulation.
+        
+        This method clips gradients, performs optimizer step, updates EMA,
+        and increments global step counter - but only when accumulation is complete.
+        
+        Args:
+            is_accumulating: If True, we're still accumulating gradients (no update)
+            
+        Returns:
+            Gradient norm value (0.0 if still accumulating)
+        """
+        grad_norm_value = 0.0
+        
+        if not is_accumulating:
+            # Gradient clipping for training stability
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            grad_norm_value = grad_norm.item()
+            
+            if grad_norm_value == 0.0:
+                warnings.warn("Gradient norm is 0.0 - model may not be learning!")
+            
+            # Update weights
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            
+            # Update EMA model
+            self._update_ema()
+            
+            self.global_step += 1
+        
+        return grad_norm_value
     
     def train_step(
         self,
@@ -288,7 +343,7 @@ class DriftingTrainer:
         log_interval: int = 100,
     ) -> Dict[str, float]:
         """
-        Train for one epoch.
+        Train for one epoch with gradient accumulation.
         
         Args:
             dataloader: DataLoader providing (latents, labels)
@@ -302,6 +357,8 @@ class DriftingTrainer:
         
         total_loss = 0.0
         num_steps = 0
+        accumulated_loss = 0.0
+        accumulation_count = 0
         
         pbar = tqdm(dataloader, desc=f"Epoch {self.epoch}")
         
@@ -309,23 +366,41 @@ class DriftingTrainer:
             x_data = x_data.to(self.device)
             labels = labels.to(self.device)
             
+            # Perform forward/backward with gradient accumulation
             if use_cfg_training:
-                metrics = self.train_step_with_cfg(x_data, labels)
+                metrics = self.train_step_with_cfg_accumulation(
+                    x_data, labels, 
+                    is_accumulating=(accumulation_count < self.gradient_accumulation_steps - 1)
+                )
             else:
-                metrics = self.train_step(x_data, labels)
+                metrics = self.train_step_accumulation(
+                    x_data, labels,
+                    is_accumulating=(accumulation_count < self.gradient_accumulation_steps - 1)
+                )
             
             if metrics.get('skip', False):
                 continue
             
-            total_loss += metrics['loss']
-            num_steps += 1
+            accumulated_loss += metrics['loss']
+            accumulation_count += 1
             
-            if batch_idx % log_interval == 0:
-                pbar.set_postfix({
-                    'loss': f"{metrics['loss']:.4f}",
-                    'cfg': f"{metrics.get('cfg_scale', 0):.2f}",
-                    'grad_norm': f"{metrics.get('grad_norm', 0):.4f}",
-                })
+            # Update weights after accumulation steps
+            if accumulation_count >= self.gradient_accumulation_steps:
+                # Average accumulated loss
+                avg_accumulated_loss = accumulated_loss / self.gradient_accumulation_steps
+                total_loss += avg_accumulated_loss
+                num_steps += 1
+                
+                # Reset accumulation
+                accumulated_loss = 0.0
+                accumulation_count = 0
+                
+                if batch_idx % log_interval == 0:
+                    pbar.set_postfix({
+                        'loss': f"{avg_accumulated_loss:.4f}",
+                        'cfg': f"{metrics.get('cfg_scale', 0):.2f}",
+                        'grad_norm': f"{metrics.get('grad_norm', 0):.4f}",
+                    })
         
         self.epoch += 1
         
@@ -335,6 +410,154 @@ class DriftingTrainer:
         return {
             'avg_loss': total_loss / max(num_steps, 1),
             'num_steps': num_steps,
+        }
+    
+    def train_step_accumulation(
+        self,
+        x_data: torch.Tensor,
+        labels: torch.Tensor,
+        is_accumulating: bool = False,
+    ) -> Dict[str, float]:
+        """
+        Single training step with gradient accumulation support.
+        
+        Args:
+            x_data: Real latent samples of shape (B, C, H, W)
+            labels: Class labels of shape (B,)
+            is_accumulating: Whether we're still accumulating gradients
+            
+        Returns:
+            Dictionary of loss values
+        """
+        batch_size = x_data.shape[0]
+        
+        # Apply VAE latent scaling factor (SD standard)
+        x_data = x_data * 0.18215
+        
+        # Add samples to queue
+        self.sample_queue.add(x_data, labels)
+        
+        # Skip if queue not ready
+        if not self.sample_queue.is_ready():
+            return {'loss': 0.0, 'skip': True}
+        
+        # Randomly drop labels for unconditional training (CFG)
+        uncond_mask = torch.rand(batch_size, device=self.device) < self.uncond_prob
+        labels_train = labels.clone()
+        labels_train[uncond_mask] = self.sample_queue.num_classes  # Unconditional label
+        
+        # Sample CFG scale
+        cfg_scale = torch.empty(1).uniform_(*self.cfg_scale_range).item()
+        
+        # Sample noise and generate with BF16 mixed precision
+        z = torch.randn(batch_size, *self.latent_shape, device=self.device)
+        
+        # Use BF16 autocast for A100/Ampere GPUs (CUDA) or skip for CPU/other devices
+        autocast_enabled = self.device == "cuda"
+        autocast_device = self.device if self.device in ["cuda", "cpu"] else "cpu"
+        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=autocast_enabled):
+            x_gen = self.model(z, labels_train, cfg_scale=cfg_scale)
+            
+            # Get positive samples from queue
+            x_pos = self.sample_queue.sample(labels, num_samples=1)
+            
+            # Compute drifting loss and scale for accumulation
+            loss = self.loss_fn(x_gen, x_pos)
+            scaled_loss = self._scale_loss_for_accumulation(loss)
+        
+        # Add unconditional samples to queue
+        if uncond_mask.any():
+            self.sample_queue.add_unconditional(x_data[uncond_mask])
+        
+        # Backward pass (accumulate gradients)
+        scaled_loss.backward()
+        
+        # Conditionally update weights
+        grad_norm_value = self._maybe_update_weights(is_accumulating)
+        
+        return {
+            'loss': loss.item(),  # Report unscaled loss
+            'cfg_scale': cfg_scale,
+            'uncond_ratio': uncond_mask.float().mean().item(),
+            'grad_norm': grad_norm_value,
+        }
+    
+    def train_step_with_cfg_accumulation(
+        self,
+        x_data: torch.Tensor,
+        labels: torch.Tensor,
+        is_accumulating: bool = False,
+    ) -> Dict[str, float]:
+        """
+        Training step with explicit CFG handling and gradient accumulation.
+        
+        Args:
+            x_data: Real latent samples of shape (B, C, H, W)
+            labels: Class labels of shape (B,)
+            is_accumulating: Whether we're still accumulating gradients
+            
+        Returns:
+            Dictionary of loss values
+        """
+        batch_size = x_data.shape[0]
+        
+        # Apply VAE latent scaling factor (SD standard)
+        x_data = x_data * 0.18215
+        
+        # Add samples to queue
+        self.sample_queue.add(x_data, labels)
+        
+        if not self.sample_queue.is_ready():
+            return {'loss': 0.0, 'skip': True}
+        
+        # Sample CFG scale
+        cfg_scale = torch.empty(1).uniform_(*self.cfg_scale_range).item()
+        
+        # Sample noise
+        z = torch.randn(batch_size, *self.latent_shape, device=self.device)
+        
+        # Use BF16 autocast for A100/Ampere GPUs (CUDA) or skip for CPU/other devices
+        autocast_enabled = self.device == "cuda"
+        autocast_device = self.device if self.device in ["cuda", "cpu"] else "cpu"
+        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=autocast_enabled):
+            # Generate conditional samples
+            x_gen_cond = self.model(z, labels, cfg_scale=cfg_scale)
+            
+            # Generate unconditional samples
+            uncond_labels = torch.full(
+                (batch_size,), self.sample_queue.num_classes,
+                device=self.device, dtype=torch.long
+            )
+            x_gen_uncond = self.model(z, uncond_labels, cfg_scale=1.0)
+            
+            # Get positive and unconditional samples from queue
+            x_pos = self.sample_queue.sample(labels, num_samples=1)
+            x_uncond = self.sample_queue.sample_unconditional(batch_size)
+            
+            # Compute CFG-weighted loss
+            loss = self.loss_fn.compute_with_cfg(
+                x_gen_cond, x_pos, x_uncond, cfg_scale
+            )
+            
+            # Also add unconditional loss
+            loss_uncond = self.loss_fn(x_gen_uncond, x_uncond)
+            
+            # Combine losses and scale for accumulation
+            total_loss = loss + self.uncond_prob * loss_uncond
+            scaled_loss = self._scale_loss_for_accumulation(total_loss)
+        
+        # Backward pass (accumulate gradients)
+        scaled_loss.backward()
+        
+        # Conditionally update weights
+        grad_norm_value = self._maybe_update_weights(is_accumulating)
+        
+        return {
+            'loss': total_loss.item(),  # Report unscaled loss
+            'loss_cond': loss.item(),
+            'loss_uncond': loss_uncond.item(),
+            'cfg_scale': cfg_scale,
+            'grad_norm': grad_norm_value,
         }
     
     @torch.no_grad()
