@@ -68,7 +68,7 @@ class DriftingLoss(nn.Module):
         
         # Build feature extractor
         if isinstance(feature_extractor, str):
-            if feature_extractor == 'latent':
+            if feature_extractor in ('latent', 'mae'):
                 self.feature_extractor = LatentFeatureExtractor(in_channels=in_channels)
             elif feature_extractor.startswith('resnet'):
                 self.feature_extractor = FeatureExtractor(
@@ -80,11 +80,80 @@ class DriftingLoss(nn.Module):
         else:
             self.feature_extractor = feature_extractor
         
+        # Track whether feature extractor is frozen
+        self._feature_extractor_frozen = False
+        
         # Loss weights for each scale
         num_scales = 4  # Default 4 scales
         if loss_weights is None:
             loss_weights = [1.0] * num_scales
         self.register_buffer('loss_weights', torch.tensor(loss_weights))
+    
+    def freeze_feature_extractor(self) -> None:
+        """
+        Freeze the feature extractor for training.
+        
+        CRITICAL for single-GPU training with Class-Grouped Sampling (Paper requirement):
+        - Sets feature extractor to eval() mode to disable BatchNorm running stats updates
+        - Sets requires_grad=False for all parameters to prevent gradient computation
+        
+        This MUST be called when using pretrained MAE encoder to prevent:
+        1. BatchNorm statistics corruption from class-grouped batches
+        2. Unintended updates to feature extractor weights during training
+        
+        Per Paper review: "Feature Extractor (MAE) MUST be in .eval() mode with 
+        requires_grad=False to prevent BatchNorm statistics pollution from grouped batches."
+        """
+        # Set to eval mode - critical for BatchNorm layers
+        self.feature_extractor.eval()
+        
+        # Freeze all parameters
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+        
+        self._feature_extractor_frozen = True
+    
+    def is_feature_extractor_frozen(self) -> bool:
+        """
+        Check if the feature extractor is properly frozen.
+        
+        Returns:
+            True if feature extractor is in eval mode and all params have requires_grad=False
+        """
+        if not self._feature_extractor_frozen:
+            return False
+        
+        # Verify all parameters are frozen
+        for param in self.feature_extractor.parameters():
+            if param.requires_grad:
+                return False
+        
+        # Verify in eval mode
+        if self.feature_extractor.training:
+            return False
+        
+        return True
+    
+    def train(self, mode: bool = True) -> 'DriftingLoss':
+        """
+        Override train() to keep feature extractor frozen if it was frozen.
+        
+        This ensures that even when DriftingLoss.train() is called (e.g., when
+        the trainer calls model.train()), the feature extractor stays in eval mode.
+        
+        Args:
+            mode: Whether to set training mode (True) or eval mode (False)
+            
+        Returns:
+            self
+        """
+        super().train(mode)
+        
+        # Keep feature extractor frozen regardless of training mode
+        if self._feature_extractor_frozen:
+            self.feature_extractor.eval()
+        
+        return self
     
     def normalize_feature_map(self, feat: torch.Tensor) -> torch.Tensor:
         """

@@ -666,6 +666,15 @@ def create_trainer(
         else:
             print("Warning: Feature extractor does not support load_pretrained method")
     
+    # CRITICAL: Freeze feature extractor for training
+    # Per Paper review: "Feature Extractor (MAE) MUST be in .eval() mode with 
+    # requires_grad=False to prevent BatchNorm statistics pollution from grouped batches."
+    # This is especially important when using Class-Grouped Sampling (K=4, M=32)
+    # where consecutive batches contain images from the same class, which would
+    # corrupt BatchNorm running statistics if not frozen.
+    loss_fn.freeze_feature_extractor()
+    print("Feature extractor frozen (eval mode, requires_grad=False)")
+    
     # Create optimizer with Paper Table 8 settings: no weight decay, standard Adam betas
     optimizer = torch.optim.AdamW(
         model.parameters(),
