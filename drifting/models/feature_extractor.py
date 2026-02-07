@@ -147,10 +147,10 @@ class FeatureExtractor(nn.Module):
         + MaxPool stem is used.
         """
         if self.is_latent:
-            # Latent mode: 3x3 stride-1, no MaxPool (Paper A.3)
+            # Latent mode: 3×3 stride-1, no MaxPool (Paper A.3)
             self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1, bias=False)
         else:
-            # Standard ResNet stem: 7x7 stride-2
+            # Standard ResNet stem: 7×7 stride-2
             self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
         self.norm1 = _make_norm(base_channels)
         self.relu = nn.ReLU(inplace=True)
